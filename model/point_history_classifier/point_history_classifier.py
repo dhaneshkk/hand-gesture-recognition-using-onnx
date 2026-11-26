@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import os
 
 import onnxruntime
 import numpy as np
@@ -11,7 +12,7 @@ from typing import (
 class PointHistoryClassifier(object):
     def __init__(
         self,
-        model_path: Optional[str] = 'model/point_history_classifier/point_history_classifier_lstm.onnx',
+        model_path: Optional[str] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'point_history_classifier_lstm.onnx'),
         providers: Optional[List] = [
             # (
             #     'TensorrtExecutionProvider', {
@@ -48,6 +49,9 @@ class PointHistoryClassifier(object):
             ]
         """
         # Model loading
+        # Drop providers this onnxruntime build does not have (avoids warnings on CPU-only installs)
+        available = onnxruntime.get_available_providers()
+        providers = [p for p in providers if (p[0] if isinstance(p, tuple) else p) in available]
         session_option = onnxruntime.SessionOptions()
         session_option.log_severity_level = 3
         self.onnx_session = onnxruntime.InferenceSession(

@@ -1,3 +1,4 @@
+import os
 import copy
 from typing import (
     Tuple,
@@ -14,7 +15,7 @@ from utils.utils import keep_aspect_resize_and_pad
 class HandLandmark(object):
     def __init__(
         self,
-        model_path: Optional[str] = 'model/hand_landmark/hand_landmark_sparse_Nx3x224x224.onnx',
+        model_path: Optional[str] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hand_landmark_sparse_Nx3x224x224.onnx'),
         class_score_th: Optional[float] = 0.50,
         providers: Optional[List] = [
             # (
@@ -57,6 +58,9 @@ class HandLandmark(object):
         self.class_score_th = class_score_th
 
         # Model loading
+        # Drop providers this onnxruntime build does not have (avoids warnings on CPU-only installs)
+        available = onnxruntime.get_available_providers()
+        providers = [p for p in providers if (p[0] if isinstance(p, tuple) else p) in available]
         session_option = onnxruntime.SessionOptions()
         session_option.log_severity_level = 3
         self.onnx_session = onnxruntime.InferenceSession(
@@ -81,7 +85,7 @@ class HandLandmark(object):
         self,
         images: List[np.ndarray],
         rects: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """HandLandmark
 
         Parameters
@@ -103,8 +107,13 @@ class HandLandmark(object):
             which the bounding box of the detected hand is rotated,
             and flags for left and right hand
             [rotated_image_width, rotated_image_height, left_hand_0_or_right_hand_1]
+
+        keep_indices: np.ndarray
+            int64[M] indices into `images`/`rects` of the hands that passed
+            class_score_th, in the same order as hand_landmarks. Callers must use
+            this to pair results with their per-detection data.
         """
-        temp_images = copy.deepcopy(images)
+        temp_images = images  # not mutated
 
         # PreProcess
         inference_images, resized_images, resize_scales_224x224, half_pad_sizes_224x224 = self.__preprocess(
@@ -118,7 +127,7 @@ class HandLandmark(object):
         )
 
         # PostProcess
-        hand_landmarks, rotated_image_size_leftrights = self.__postprocess(
+        hand_landmarks, rotated_image_size_leftrights, keep_indices = self.__postprocess(
             resized_images=resized_images,
             resize_scales_224x224=resize_scales_224x224,
             half_pad_sizes_224x224=half_pad_sizes_224x224,
@@ -128,7 +137,7 @@ class HandLandmark(object):
             left_hand_0_or_right_hand_1s=left_hand_0_or_right_hand_1s,
         )
 
-        return hand_landmarks, rotated_image_size_leftrights
+        return hand_landmarks, rotated_image_size_leftrights, keep_indices
 
 
     def __preprocess(
@@ -154,7 +163,7 @@ class HandLandmark(object):
         padded_images: np.ndarray
             Resized and Padding and normalized image. [N,C,H,W]
         """
-        temp_images = copy.deepcopy(images)
+        temp_images = images  # not mutated
 
         # Resize + Padding + Normalization + BGR->RGB
         input_h = self.input_shapes[0][2]
@@ -253,6 +262,7 @@ class HandLandmark(object):
         rotated_image_size_leftrights = []
 
         keep = hand_scores[:, 0] > self.class_score_th # hand_score > self.class_score_th
+        keep_indices = np.nonzero(keep)[0]
         xyz_x21s = xyz_x21s[keep, :]
         hand_scores = hand_scores[keep, :]
         left_hand_0_or_right_hand_1s = left_hand_0_or_right_hand_1s[keep, :]
@@ -286,41 +296,31 @@ class HandLandmark(object):
             rcy = rect[1]
             angle = rect[4]
 
-            view_image = copy.deepcopy(resized_image)
-            view_image = cv2.resize(
-                view_image,
-                dsize=None,
-                fx=1/resize_scale_224x224[0],
-                fy=1/resize_scale_224x224[1],
-            )
+            # Size the crop would have after undoing the 224x224 resize
+            # (same rounding as cv2.resize with fx/fy), computed without resizing.
+            width = int(round(resized_image.shape[1] / resize_scale_224x224[0]))
+            height = int(round(resized_image.shape[0] / resize_scale_224x224[1]))
             rescaled_xy = np.asarray([[v[0], v[1]] for v in zip(rrn_lms[0::3], rrn_lms[1::3])], dtype=np.float32)
             rescaled_xy[:, 0] = (rescaled_xy[:, 0] * input_w - half_pad_size_224x224[0]) / resize_scale_224x224[0]
             rescaled_xy[:, 1] = (rescaled_xy[:, 1] * input_h - half_pad_size_224x224[1]) / resize_scale_224x224[1]
             rescaled_xy = rescaled_xy.astype(np.int32)
 
-            height, width = view_image.shape[:2]
             image_center = (width//2, height//2)
-            rotation_matrix = cv2.getRotationMatrix2D(image_center, -int(angle), 1)
+            rotation_matrix = cv2.getRotationMatrix2D(image_center, -float(angle), 1)
             abs_cos = abs(rotation_matrix[0,0])
             abs_sin = abs(rotation_matrix[0,1])
             bound_w = int(height * abs_sin + width * abs_cos)
             bound_h = int(height * abs_cos + width * abs_sin)
             rotation_matrix[0, 2] += bound_w/2 - image_center[0]
             rotation_matrix[1, 2] += bound_h/2 - image_center[1]
-            rotated_image = cv2.warpAffine(view_image, rotation_matrix, (bound_w, bound_h))
 
-            keypoints = []
-            for x,y in rescaled_xy:
-                coord_arr = np.array([
-                    [x, y, 1],  # Left-Top
-                ])
-                new_coord = rotation_matrix.dot(coord_arr.T)
-                x_ls = new_coord[0]
-                y_ls = new_coord[1]
-                keypoints.append([int(x_ls), int(y_ls)])
+            # Apply the 2x3 affine to all 21 points at once (also NumPy 2.x safe:
+            # int() of a 1-element array is an error there).
+            homog = np.concatenate([rescaled_xy, np.ones((len(rescaled_xy), 1), np.int32)], axis=1)
+            keypoints = (homog @ rotation_matrix.T).astype(np.int32)
 
-            rotated_image_width = rotated_image.shape[1]
-            rotated_image_height = rotated_image.shape[0]
+            rotated_image_width = bound_w
+            rotated_image_height = bound_h
             roatated_hand_half_width = rotated_image_width//2
             roatated_hand_half_height = rotated_image_height//2
 
@@ -328,6 +328,9 @@ class HandLandmark(object):
             hand_landmarks[..., 0] = hand_landmarks[..., 0] + rcx - roatated_hand_half_width
             hand_landmarks[..., 1] = hand_landmarks[..., 1] + rcy - roatated_hand_half_height
             extracted_hands.append(hand_landmarks)
-            rotated_image_size_leftrights.append([rotated_image_width, rotated_image_height, float(left_hand_0_or_right_hand_1)])
+            rotated_image_size_leftrights.append([rotated_image_width, rotated_image_height, float(np.ravel(left_hand_0_or_right_hand_1)[0])])
 
-        return np.asarray(extracted_hands, dtype=np.int32), np.asarray(rotated_image_size_leftrights)
+        return \
+            np.asarray(extracted_hands, dtype=np.int32).reshape(-1, 21, 2), \
+            np.asarray(rotated_image_size_leftrights, dtype=np.float32).reshape(-1, 3), \
+            keep_indices

@@ -190,7 +190,7 @@ def image_rotation_without_crop(
     for image, angle in zip(images, angles):
         height, width = image.shape[:2]
         image_center = (width//2, height//2)
-        rotation_matrix = cv2.getRotationMatrix2D(image_center, int(angle), 1)
+        rotation_matrix = cv2.getRotationMatrix2D(image_center, float(np.ravel(angle)[0]), 1)
         abs_cos = abs(rotation_matrix[0,0])
         abs_sin = abs(rotation_matrix[0,1])
         bound_w = int(height * abs_sin + width * abs_cos)

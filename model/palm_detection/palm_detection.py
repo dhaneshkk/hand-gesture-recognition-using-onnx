@@ -1,3 +1,4 @@
+import os
 import copy
 from typing import (
     Tuple,
@@ -22,7 +23,7 @@ from utils.utils import (
 class PalmDetection(object):
     def __init__(
         self,
-        model_path: Optional[str] = 'model/palm_detection/palm_detection_full_inf_post_192x192.onnx',
+        model_path: Optional[str] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'palm_detection_full_inf_post_192x192.onnx'),
         score_threshold: Optional[float] = 0.60,
         providers: Optional[List] = [
             # (
@@ -65,6 +66,9 @@ class PalmDetection(object):
         self.score_threshold = score_threshold
 
         # Model loading
+        # Drop providers this onnxruntime build does not have (avoids warnings on CPU-only installs)
+        available = onnxruntime.get_available_providers()
+        providers = [p for p in providers if (p[0] if isinstance(p, tuple) else p) in available]
         session_option = onnxruntime.SessionOptions()
         session_option.log_severity_level = 3
         self.onnx_session = onnxruntime.InferenceSession(
@@ -102,8 +106,10 @@ class PalmDetection(object):
         hands: np.ndarray
             float32[N, 4]
             sqn_rr_size, rotation, sqn_rr_center_x, sqn_rr_center_y
+            sqn_rr_size is relative to max(frame_height, frame_width);
+            centre coordinates are relative to frame width / height.
         """
-        temp_image = copy.deepcopy(image)
+        temp_image = image  # read-only below; no copy needed
 
         # PreProcess
         inference_image = self.__preprocess(
@@ -155,7 +161,9 @@ class PalmDetection(object):
         image_height , image_width = image.shape[:2]
 
         self.square_standard_size = max(image_height, image_width)
-        self.square_padding_half_size = abs(image_height - image_width) // 2
+        # keep_aspect_resize_and_pad centres the image, so exactly one axis is padded
+        self.square_padding_half_w = (self.square_standard_size - image_width) / 2
+        self.square_padding_half_h = (self.square_standard_size - image_height) / 2
 
         padded_image, resized_image = keep_aspect_resize_and_pad(
             image=image,
@@ -218,7 +226,9 @@ class PalmDetection(object):
                 rotation = normalize_radians(rotation)
                 sqn_rr_center_x = box_x + 0.5*box_size*sin(rotation)
                 sqn_rr_center_y = box_y - 0.5*box_size*cos(rotation)
-                sqn_rr_center_y = (sqn_rr_center_y * self.square_standard_size - self.square_padding_half_size) / image_height
+                # Normalised coords are relative to the padded square; map back to the frame.
+                sqn_rr_center_x = (sqn_rr_center_x * self.square_standard_size - self.square_padding_half_w) / image_width
+                sqn_rr_center_y = (sqn_rr_center_y * self.square_standard_size - self.square_padding_half_h) / image_height
                 hands.append(
                     [
                         sqn_rr_size,
