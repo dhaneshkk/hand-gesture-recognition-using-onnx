@@ -194,3 +194,34 @@ FPS計測用のモジュールです。
 - [ ] 変数とループの整理
 - [ ] CSVロギングの見直し
 - [ ] DeepSort
+
+# Fork changes (dhaneshkk)
+
+### Fixes in `app.py` and the model wrappers
+- **One-to-one hand tracking** (`utils/tracker.py`): global greedy matching, so two hands can no longer share a track ID. Tracks that go `--track_max_missed` frames without a match are dropped, together with their fingertip and gesture history.
+- **Per-hand data stays paired**: `HandLandmark` returns `keep_indices`, and landmarks, signs, fingertip histories, gesture votes and labels are all keyed by track ID. Before, a low-scoring hand or a change in detection order could attach one hand's data to another's box. The fingertip history is also updated before classification, removing a one-frame lag.
+- **Training-data logging matches the notebooks**: rows are `label, 42 features` (keypoint) and `label, 32 features` (history). The old logger added a `trackid` column, which the notebooks then read as a feature. Every hand is logged, and point histories are only logged once they are full length.
+- **Geometry uses the real frame size**, not `--width/--height`, and portrait frames are handled (padding correction on both axes). Rotation angles stay as floats.
+- **The video writer** is created from the first real frame. Use `-o/--output` to set the file, `-nv/--no_video` to skip recording, and `--headless` to run without a window.
+- Model and CSV paths are resolved relative to the repo, so the app can be started from any directory. Fixed NumPy 2.x crashes in `HandLandmark`, and CUDA warnings no longer appear on CPU-only installs.
+
+### Retraining with SAM + MCC
+[`train_sam_mcc.ipynb`](train_sam_mcc.ipynb) is a single Colab cell. It retrains both classifiers with **Sharpness-Aware Minimization** (rho=0.05, wrapping Adam) on a stratified 70/15/15 split, picks the checkpoint by **validation MCC**, reports **test MCC** (checked against scikit-learn) with confusion matrices, and exports ONNX models with the same interface as the shipped ones.
+
+| model | test MCC, SAM retrain | test MCC, shipped model* |
+|---|---|---|
+| keypoint (3 classes, n=668) | 0.955 | 0.951 |
+| point history LSTM (4 classes, n=795) | 0.953 | 0.975 |
+
+\* The shipped models were trained on the same CSVs with a different split, so part of this test set was probably in their training data, and their numbers are optimistic.
+
+```bash
+python app.py \
+  --keypoint_model model/keypoint_classifier/keypoint_classifier_sam.onnx \
+  --point_history_model model/point_history_classifier/point_history_classifier_lstm_sam.onnx
+```
+
+### Verification
+- `python -m pytest -q tests`: tracker invariants (randomised), CSV schema against the notebook loaders, and end-to-end landmarks on `hand.png` checked across resolutions and portrait rotation.
+- `proofs/TrackerInjective.lean` (Lean 4, core only) proves the tracker's greedy matching is one-to-one and only returns candidate pairs. CI checks it (`.github/workflows/ci.yml`).
+
